@@ -1,121 +1,182 @@
 package dhp.tpl.norecall
 
+import android.app.Notification
+import android.app.NotificationManager
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.callbacks.XC_LoadPackage
-import org.luckypray.dexkit.DexKitBridge
-import org.luckypray.dexkit.result.MethodData
-import java.lang.reflect.Constructor
-import java.lang.reflect.Method
+import java.util.Collections
+import java.util.LinkedHashMap
 
 /**
- * Messenger Anti-Unsend / Anti-Recall Hook with Detailed Debug Logging
+ * Messenger Anti-Unsend / Anti-Recall Hook.
+ *
+ * Intercepts incoming messages to cache their contents (from both notifications
+ * and UI models), blocks incoming unsend commands, and restores original
+ * message contents on recalled/deleted message items.
  */
 object MessengerHook {
 
-    const val TARGET = "com.facebook.orca"
     private const val TAG = Resolver.TAG
 
+    // Cache message content by message ID: id -> text
+    private val messageCache = Collections.synchronizedMap(
+        object : LinkedHashMap<String, String>(500, 0.75f, true) {
+            override fun removeEldestEntry(eldest: Map.Entry<String, String>): Boolean = size > 500
+        }
+    )
+
+    // Cache recent notifications by sender: senderName -> text
+    private val notifCache = Collections.synchronizedMap(
+        object : LinkedHashMap<String, String>(100, 0.75f, true) {
+            override fun removeEldestEntry(eldest: Map.Entry<String, String>): Boolean = size > 100
+        }
+    )
+
+    private val idRegex = Regex("""\bid=(\d+)""")
+
     fun install(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
-        XposedBridge.log("$TAG: Installing hooks for ${lp.packageName} (process: ${lp.processName})...")
-        hookMessageTypeClassifier(lp, modulePath)
-        hookMsysAdapter(lp, modulePath)
+        XposedBridge.log("$TAG: Installing anti-unsend hooks for ${lp.packageName} (process: ${lp.processName})...")
+        hookNotifications()
+        hookTextMessage(lp, modulePath)
+        hookTombstoneModel(lp, modulePath)
         hookTamUnsend(lp, modulePath)
         hookRecallDelta(lp, modulePath)
-        hookUiMessageModel(lp, modulePath)
     }
 
     /**
-     * Hook 1: Message Type Classifier (X.55y.A00).
+     * Intercepts system notifications posted by Messenger to capture message content
+     * even before the chat is opened.
      */
-    private fun hookMessageTypeClassifier(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
-        val methods = Resolver.resolve(lp, modulePath, "type_classifier", 1) { bridge ->
-            val results = bridge.findMethod {
-                matcher {
-                    usingStrings("TombstoneMessage", "TextMessage", "PhotoMessage")
-                }
-            }
-            if (results.isEmpty()) null else listOf(results.first())
-        }
-
-        if (methods == null) {
-            XposedBridge.log("$TAG: [Classifier] Message type classifier not found")
-            return
-        }
-
-        val method = methods[0]
-        val returnType = method.returnType
-
-        var constructor: Constructor<*>? = null
+    private fun hookNotifications() {
         try {
-            constructor = returnType.getDeclaredConstructor(String::class.java).apply {
-                isAccessible = true
-            }
-        } catch (t: Throwable) {
-            XposedBridge.log("$TAG: [Classifier] Constructor error: $t")
-        }
-
-        XposedBridge.hookMethod(method, object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                val res = param.result ?: return
-                val resStr = res.toString()
-                
-                // Detailed debug logging
-                if (resStr.contains("Tombstone") || resStr.contains("Admin") || resStr.contains("Unavailable")) {
-                    XposedBridge.log("$TAG: [Classifier-DEBUG] Intercepted classification: $resStr, arg: ${param.args.firstOrNull()}")
-                    if (constructor != null) {
-                        try {
-                            param.result = constructor.newInstance("TextMessage")
-                            XposedBridge.log("$TAG: [Classifier-DEBUG] Successfully returned new TextMessage object!")
-                        } catch (t: Throwable) {
-                            XposedBridge.log("$TAG: [Classifier-DEBUG] Instantiation failed: $t")
-                        }
-                    } else {
-                        for (field in res.javaClass.declaredFields) {
-                            field.isAccessible = true
-                            val fVal = field.get(res)
-                            if (fVal is String) {
-                                field.set(res, "TextMessage")
-                                XposedBridge.log("$TAG: [Classifier-DEBUG] Mutated field ${field.name} to TextMessage")
+            val nmClass = NotificationManager::class.java
+            for (method in nmClass.declaredMethods) {
+                if (method.name == "notify" && method.parameterTypes.contains(Notification::class.java)) {
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val notif = param.args.firstOrNull { it is Notification } as? Notification ?: return
+                            val extras = notif.extras ?: return
+                            val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim()
+                            val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim()
+                            if (!title.isNullOrBlank() && !text.isNullOrBlank()) {
+                                notifCache[title] = text
+                                XposedBridge.log("$TAG: [NotifCache] Stored notification from '$title': '$text'")
                             }
                         }
-                    }
+                    })
                 }
             }
-        })
-        XposedBridge.log("$TAG: [Classifier] Hooked ${method.declaringClass.name}.${method.name}")
+            XposedBridge.log("$TAG: [Notif] Hooked NotificationManager.notify")
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: [Notif] Failed to hook NotificationManager: $t")
+        }
     }
 
     /**
-     * Hook 2: MsysToGraphqlMessageListSnapshotAdapter (X.VIF.A0H).
+     * Hook 1: TextMessage Model Constructor.
+     * Caches original message text mapped to the message ID.
      */
-    private fun hookMsysAdapter(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
-        val methods = Resolver.resolve(lp, modulePath, "msys_adapter", 1) { bridge ->
-            val results = bridge.findMethod {
+    private fun hookTextMessage(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
+        val textClass = Resolver.resolveClass(lp, modulePath, "text_class") { bridge ->
+            val results = bridge.findClass {
                 matcher {
-                    usingStrings("MsysToGraphqlMessageListSnapshotAdapter.convertFlatMessagesToGraphqlModel")
+                    usingStrings("[TextMessage text=")
                 }
             }
-            if (results.isEmpty()) null else listOf(results.first())
+            results.firstOrNull()
         }
 
-        if (methods == null) {
-            XposedBridge.log("$TAG: [Adapter] Msys adapter not found")
+        if (textClass == null) {
+            XposedBridge.log("$TAG: [TextMessage] not found via DexKit")
             return
         }
 
-        val method = methods[0]
-        XposedBridge.hookMethod(method, object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                val list = param.result as? List<*> ?: return
-                XposedBridge.log("$TAG: [Adapter-DEBUG] Processing snapshot of ${list.size} messages")
-                for (item in list) {
-                    if (item == null) continue
-                    clearUnsentFlags(item)
+        for (constructor in textClass.declaredConstructors) {
+            XposedBridge.hookMethod(constructor, object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val instance = param.thisObject ?: return
+                    try {
+                        val id = extractMessageId(instance)
+                        var text: String? = null
+                        for (field in textClass.declaredFields) {
+                            if (CharSequence::class.java.isAssignableFrom(field.type)) {
+                                field.isAccessible = true
+                                val v = field.get(instance)?.toString()
+                                if (!v.isNullOrBlank()) {
+                                    text = v
+                                    break
+                                }
+                            }
+                        }
+                        if (id != null && text != null) {
+                            messageCache[id] = text
+                            XposedBridge.log("$TAG: [Cache] Saved text message (id=$id): '$text'")
+                        }
+                    } catch (t: Throwable) {
+                        XposedBridge.log("$TAG: [TextMessage] Error caching: $t")
+                    }
+                }
+            })
+        }
+        XposedBridge.log("$TAG: [TextMessage] Hooked ${textClass.name} constructors")
+    }
+
+    /**
+     * Hook 2: TombstoneMessage Model Constructor.
+     * When a message is deleted, Messenger creates a TombstoneMessage with snippet="[Name] deleted a message".
+     * We intercept this constructor and restore the original text or tag it visibly as recalled.
+     */
+    private fun hookTombstoneModel(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
+        val tombstoneClass = Resolver.resolveClass(lp, modulePath, "tombstone_class") { bridge ->
+            val results = bridge.findClass {
+                matcher {
+                    usingStrings("[TombstoneMessage snippet=")
                 }
             }
-        })
-        XposedBridge.log("$TAG: [Adapter] Hooked ${method.declaringClass.name}.${method.name}")
+            results.firstOrNull()
+        }
+
+        if (tombstoneClass == null) {
+            XposedBridge.log("$TAG: [TombstoneModel] not found via DexKit")
+            return
+        }
+
+        for (constructor in tombstoneClass.declaredConstructors) {
+            XposedBridge.hookMethod(constructor, object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val instance = param.thisObject ?: return
+                    try {
+                        val id = extractMessageId(instance)
+                        for (field in tombstoneClass.declaredFields) {
+                            if (field.type == String::class.java) {
+                                field.isAccessible = true
+                                val oldSnippet = field.get(instance) as? String ?: continue
+                                if (oldSnippet.startsWith("🔴 [Recalled]")) break
+
+                                val cachedText = if (id != null) messageCache[id] else null
+                                val newSnippet = when {
+                                    cachedText != null -> "🔴 [Recalled]: $cachedText"
+                                    else -> {
+                                        val sender = oldSnippet.substringBefore(" deleted")
+                                            .substringBefore(" đã thu hồi")
+                                            .trim()
+                                        val notif = if (sender.isNotEmpty()) notifCache[sender] else null
+                                        if (notif != null) "🔴 [Recalled]: $notif" else "🔴 [Recalled] $oldSnippet"
+                                    }
+                                }
+                                field.set(instance, newSnippet)
+                                XposedBridge.log("$TAG: [TombstoneModel] Intercepted tombstone (id=$id): '$oldSnippet' -> '$newSnippet'")
+                                break
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        XposedBridge.log("$TAG: [TombstoneModel] Error overriding snippet: $t")
+                    }
+                }
+            })
+        }
+        XposedBridge.log("$TAG: [TombstoneModel] Hooked ${tombstoneClass.name} constructors")
     }
 
     /**
@@ -139,9 +200,8 @@ object MessengerHook {
         val method = methods[0]
         XposedBridge.hookMethod(method, object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
-                XposedBridge.log("$TAG: [TAM-DEBUG] runTamClientMessageUnsend CALLED! Args: ${param.args.joinToString()}")
                 param.result = null
-                XposedBridge.log("$TAG: [TAM-DEBUG] Canceled execution.")
+                XposedBridge.log("$TAG: [TAM] Intercepted & blocked runTamClientMessageUnsend!")
             }
         })
         XposedBridge.log("$TAG: [TAM] Hooked ${method.declaringClass.name}.${method.name}")
@@ -154,7 +214,7 @@ object MessengerHook {
         val methods = Resolver.resolve(lp, modulePath, "recall_delta", 1) { bridge ->
             val results = bridge.findMethod {
                 matcher {
-                    usingStrings("FbnMICoreGqlRecallMessageDeltaApplicatorFactory")
+                    usingStrings("applyMinosServerDeltas", "recallDeltaApplicator")
                 }
             }
             if (results.isEmpty()) null else listOf(results.first())
@@ -168,62 +228,26 @@ object MessengerHook {
         val method = methods[0]
         XposedBridge.hookMethod(method, object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
-                XposedBridge.log("$TAG: [Delta-DEBUG] Recall delta applicator CALLED! Args: ${param.args.joinToString()}")
                 param.result = null
-                XposedBridge.log("$TAG: [Delta-DEBUG] Canceled execution.")
+                XposedBridge.log("$TAG: [Delta] Intercepted & blocked recall delta applicator!")
             }
         })
         XposedBridge.log("$TAG: [Delta] Hooked ${method.declaringClass.name}.${method.name}")
     }
 
-    /**
-     * Hook 5: UI Renderer isUnsent Check.
-     */
-    private fun hookUiMessageModel(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
-        val methods = Resolver.resolve(lp, modulePath, "ui_msg_model", 1) { bridge ->
-            val results = bridge.findMethod {
-                matcher {
-                    usingStrings("ig_detected_outcome", "isUnsent")
-                }
-            }
-            if (results.isEmpty()) null else listOf(results.first())
-        }
+    private fun extractMessageId(instance: Any): String? {
+        val str = instance.toString()
+        val match = idRegex.find(str)
+        if (match != null) return match.groupValues[1]
 
-        if (methods == null) {
-            XposedBridge.log("$TAG: [UI] Message model method not found")
-            return
+        for (field in instance.javaClass.declaredFields) {
+            try {
+                field.isAccessible = true
+                val value = field.get(instance) ?: continue
+                val fieldMatch = idRegex.find(value.toString())
+                if (fieldMatch != null) return fieldMatch.groupValues[1]
+            } catch (_: Throwable) {}
         }
-
-        val method = methods[0]
-        XposedBridge.hookMethod(method, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                for (arg in param.args) {
-                    if (arg == null) continue
-                    clearUnsentFlags(arg)
-                }
-            }
-        })
-        XposedBridge.log("$TAG: [UI] Hooked ${method.declaringClass.name}.${method.name}")
-    }
-
-    private fun clearUnsentFlags(obj: Any) {
-        val clazz = obj.javaClass
-        for (m in clazz.methods) {
-            if (m.parameterCount == 0 && (m.returnType == Boolean::class.java || m.returnType == java.lang.Boolean.TYPE)) {
-                val name = m.name.lowercase()
-                if (name.contains("unsent") || name.contains("tombstone")) {
-                    try {
-                        XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                            override fun afterHookedMethod(p: MethodHookParam) {
-                                if (p.result == true) {
-                                    XposedBridge.log("$TAG: [Flag-DEBUG] Overrode $name() from true to false on ${clazz.simpleName}")
-                                }
-                                p.result = false
-                            }
-                        })
-                    } catch (_: Throwable) {}
-                }
-            }
-        }
+        return null
     }
 }
