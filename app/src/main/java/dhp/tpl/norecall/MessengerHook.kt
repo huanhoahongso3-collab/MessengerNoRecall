@@ -2,6 +2,7 @@ package dhp.tpl.norecall
 
 import android.app.Notification
 import android.app.NotificationManager
+import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.os.Bundle
 import de.robv.android.xposed.XC_MethodHook
@@ -13,8 +14,8 @@ import java.util.Collections
 import java.util.LinkedHashMap
 
 /**
- * Messenger Anti-Unsend / Anti-Recall Hook with Multi-Identifier Indexing,
- * SQLite Full Database Scanner, and Robust Group/Direct Notification Matching.
+ * Messenger Anti-Unsend / Anti-Recall Hook with Reverb Deleted Messages Scanner,
+ * Multi-Key Identification, and Persistent Disk Cache.
  */
 object MessengerHook {
 
@@ -25,12 +26,12 @@ object MessengerHook {
 
     // Multi-key message cache: (ID, MID, timestamp, otid) -> text
     private val messageCache = Collections.synchronizedMap(
-        object : LinkedHashMap<String, String>(5000, 0.75f, true) {
-            override fun removeEldestEntry(eldest: Map.Entry<String, String>): Boolean = size > 5000
+        object : LinkedHashMap<String, String>(10000, 0.75f, true) {
+            override fun removeEldestEntry(eldest: Map.Entry<String, String>): Boolean = size > 10000
         }
     )
 
-    // Sender -> latest message text (e.g. "Hồng Phúc" -> "Hello")
+    // Sender -> latest message text
     private val notifCache = Collections.synchronizedMap(
         object : LinkedHashMap<String, String>(500, 0.75f, true) {
             override fun removeEldestEntry(eldest: Map.Entry<String, String>): Boolean = size > 500
@@ -119,8 +120,8 @@ object MessengerHook {
     }
 
     /**
-     * Scan Messenger local SQLite databases (msys_database, threads_db2, etc.)
-     * and index EVERY message by all its identifier columns (message_id, otid, timestamp_ms).
+     * Scan Messenger local SQLite databases including reverb_db (which stores deleted messages!),
+     * msys_database, and threads_db2.
      */
     private fun scanLocalDatabases(lp: XC_LoadPackage.LoadPackageParam) {
         try {
@@ -132,7 +133,7 @@ object MessengerHook {
                 if (!file.isFile || file.length() < 1024) continue
                 val name = file.name
                 if (name.endsWith("-wal") || name.endsWith("-journal") || name.endsWith("-shm")) continue
-                if (!name.contains("msys") && !name.contains("threads") && !name.endsWith(".db")) continue
+                if (!name.contains("reverb") && !name.contains("msys") && !name.contains("threads") && !name.endsWith(".db")) continue
 
                 try {
                     val db = SQLiteDatabase.openDatabase(file.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
@@ -144,6 +145,12 @@ object MessengerHook {
                     cursor.close()
 
                     for (table in tables) {
+                        // Scan reverb_db tables (where deleted messages are stored!)
+                        if (name.contains("reverb")) {
+                            scanReverbTable(file.name, db, table)
+                            continue
+                        }
+
                         if (!table.contains("message", ignoreCase = true)) continue
 
                         val colCursor = db.rawQuery("PRAGMA table_info($table)", null)
@@ -152,8 +159,6 @@ object MessengerHook {
                             cols.add(colCursor.getString(1))
                         }
                         colCursor.close()
-
-                        XposedBridge.log("$TAG: [DB] Inspecting table ${file.name}.$table (columns: $cols)")
 
                         val textCols = cols.filter {
                             it.equals("text", ignoreCase = true) ||
@@ -172,7 +177,6 @@ object MessengerHook {
                         }
 
                         val q = db.rawQuery("SELECT * FROM $table", null)
-                        val colNames = q.columnNames
                         var count = 0
                         while (q.moveToNext()) {
                             var textVal: String? = null
@@ -190,7 +194,6 @@ object MessengerHook {
                             }
                             if (textVal == null) continue
 
-                            // Map all identifier columns to this text
                             for (ic in idCols) {
                                 val idx = q.getColumnIndex(ic)
                                 if (idx != -1 && !q.isNull(idx)) {
@@ -204,7 +207,7 @@ object MessengerHook {
                         }
                         q.close()
                         if (count > 0) {
-                            XposedBridge.log("$TAG: [DB] Pre-loaded and multi-indexed $count messages from ${file.name}.$table")
+                            XposedBridge.log("$TAG: [DB] Pre-loaded $count messages from ${file.name}.$table")
                         }
                     }
                     db.close()
@@ -217,6 +220,78 @@ object MessengerHook {
             }
         } catch (t: Throwable) {
             XposedBridge.log("$TAG: [DB] Database scan error: $t")
+        }
+    }
+
+    /**
+     * Scans reverb_db tables (specifically local_message_persistence_store_deleted_messages
+     * and local_message_persistence_store) to recover payloads of deleted messages!
+     */
+    private fun scanReverbTable(dbName: String, db: SQLiteDatabase, table: String) {
+        if (!table.contains("persistence_store")) return
+        try {
+            val colCursor = db.rawQuery("PRAGMA table_info($table)", null)
+            val cols = mutableListOf<String>()
+            while (colCursor.moveToNext()) {
+                cols.add(colCursor.getString(1))
+            }
+            colCursor.close()
+
+            val otidCol = cols.firstOrNull { it.contains("offline_threading_id", ignoreCase = true) } ?: return
+            val payloadCol = cols.firstOrNull { it.contains("payload", ignoreCase = true) } ?: return
+            val tsCol = cols.firstOrNull { it.contains("timestamp", ignoreCase = true) }
+
+            val q = db.rawQuery("SELECT $otidCol, $payloadCol ${if (tsCol != null) ", $tsCol" else ""} FROM $table", null)
+            var count = 0
+            while (q.moveToNext()) {
+                val otid = q.getString(0)
+                val text = extractTextFromPayload(q, 1)
+                val ts = if (tsCol != null && !q.isNull(2)) q.getString(2) else null
+
+                if (!otid.isNullOrBlank() && !text.isNullOrBlank()) {
+                    messageCache[otid] = text
+                    if (!ts.isNullOrBlank()) messageCache[ts] = text
+                    count++
+                    XposedBridge.log("$TAG: [Reverb] Recovered from $table: otid=$otid -> '$text'")
+                }
+            }
+            q.close()
+            if (count > 0) {
+                XposedBridge.log("$TAG: [Reverb] Loaded $count deleted/persisted messages from $dbName.$table")
+            }
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: [Reverb] Error scanning $table: $t")
+        }
+    }
+
+    private fun extractTextFromPayload(cursor: Cursor, colIdx: Int): String? {
+        try {
+            val blob = try { cursor.getBlob(colIdx) } catch (_: Throwable) { null }
+            val s = if (blob != null) {
+                String(blob, Charsets.UTF_8)
+            } else {
+                cursor.getString(colIdx) ?: return null
+            }
+
+            if (s.contains("\"text\":")) {
+                val m = Regex(""""text"\s*:\s*"([^"]+)"""").find(s)
+                if (m != null) return m.groupValues[1]
+            }
+            if (s.contains("\"body\":")) {
+                val m = Regex(""""body"\s*:\s*"([^"]+)"""").find(s)
+                if (m != null) return m.groupValues[1]
+            }
+
+            // Find valid human-readable string sequence from payload
+            val matches = Regex("""[\p{L}\p{N}\p{P}\p{Z}]{2,}""").findAll(s)
+            val candidates = matches
+                .map { it.value.trim() }
+                .filter { it.length >= 2 && !it.startsWith("mid.") && !it.startsWith("http") && !it.contains("com.facebook") && !it.all { c -> c.isDigit() } }
+                .toList()
+
+            return candidates.maxByOrNull { it.length }
+        } catch (_: Throwable) {
+            return null
         }
     }
 
@@ -245,7 +320,6 @@ object MessengerHook {
 
                             if (!title.isNullOrBlank() && !resolvedText.isNullOrBlank()) {
                                 putNotif(title, resolvedText)
-                                // Also index under sender name after colon for group chats (e.g. "Group: Sender")
                                 if (title.contains(": ")) {
                                     val individualSender = title.substringAfter(": ").trim()
                                     if (individualSender.isNotEmpty()) {
@@ -389,7 +463,6 @@ object MessengerHook {
                                 val oldSnippet = field.get(instance) as? String ?: continue
                                 if (oldSnippet.startsWith("🔴 [Recalled]")) break
 
-                                // Look up cached text by all possible candidate keys
                                 var cachedText: String? = null
                                 for (id in ids) {
                                     val t = messageCache[id]
@@ -406,7 +479,6 @@ object MessengerHook {
                                     .substringBefore(" recalled")
                                     .trim()
 
-                                // If not found by ID, look up by sender in notification cache
                                 val notif = if (sender.isNotEmpty()) {
                                     notifCache[sender] ?: notifCache.entries.firstOrNull {
                                         it.key.contains(sender, ignoreCase = true)
@@ -519,7 +591,7 @@ object MessengerHook {
                             }
                         }
                         is Long -> {
-                            if (v > 1000000000000L) { // timestamp in ms (e.g. 1792577774743)
+                            if (v > 1000000000000L) { // timestamp in ms
                                 ids.add(v.toString())
                             }
                         }
