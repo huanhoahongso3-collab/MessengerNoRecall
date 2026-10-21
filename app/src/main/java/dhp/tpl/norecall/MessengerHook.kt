@@ -11,11 +11,12 @@ import java.lang.reflect.Method
  * Messenger Anti-Unsend / Anti-Recall Hook
  *
  * Intercepts:
- * 1. MsysToGraphqlMessageListSnapshotAdapter: forces `is_unsent` in the CQL message list to false/null
- *    so recalling messages never hides the text or switches to tombstone.
- * 2. TAM / Armadillo / E2EE Mailbox client unsend (`runTamClientMessageUnsend`)
- * 3. Minos / GraphQL recall delta applicator (`FbnMICoreGqlRecallMessageDeltaApplicatorFactory`)
- * 4. Message UI renderer model (`isUnsent` checks)
+ * 1. UI message type classifier (X.55y.A00): Prevents any message from being converted
+ *    into a TombstoneMessage / AdminMessage type when unsent!
+ * 2. MsysToGraphqlMessageListSnapshotAdapter (X.VIF.A0H): Prevents messages from being
+ *    flagged as is_unsent in the CQL message list.
+ * 3. TAM / Armadillo / E2EE Mailbox client unsend (X.20l.A06): Prevents local database deletion.
+ * 4. Minos / GraphQL recall delta applicator (X.8FS.A00): Blocks recall pushes.
  */
 object MessengerHook {
 
@@ -23,6 +24,7 @@ object MessengerHook {
     private const val TAG = Resolver.TAG
 
     fun install(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
+        hookMessageTypeClassifier(lp, modulePath)
         hookMsysAdapter(lp, modulePath)
         hookTamUnsend(lp, modulePath)
         hookRecallDelta(lp, modulePath)
@@ -30,11 +32,54 @@ object MessengerHook {
     }
 
     /**
-     * Hook 1: MsysToGraphqlMessageListSnapshotAdapter.
-     * When messages are loaded from SQLite / Mailbox into the GraphQL model for display,
-     * this adapter reads the flat CQL table.
-     * We hook the adapter and force any message marked with isUnsent back to false,
-     * restoring its original text, photo, audio, and attachments!
+     * Hook 1: Message Type Classifier (X.55y.A00).
+     * Maps message data into rendering types: TextMessage, PhotoMessage, TombstoneMessage, etc.
+     * If a message is recalled, Messenger tries to return TombstoneMessage or AdminMessage.
+     * We intercept afterHookedMethod and check the returned model / type:
+     * If it is a TombstoneMessage or its string representation contains "Tombstone",
+     * we inspect the underlying message data (param.args[0]) and return the normal Text/Media type!
+     */
+    private fun hookMessageTypeClassifier(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
+        val methods = Resolver.resolve(lp, modulePath, "type_classifier", 1) { bridge ->
+            val results = bridge.findMethod {
+                matcher {
+                    usingStrings("TombstoneMessage", "TextMessage", "PhotoMessage")
+                }
+            }
+            if (results.isEmpty()) null else listOf(results.first())
+        }
+
+        if (methods == null) {
+            XposedBridge.log("$TAG: [Classifier] Message type classifier not found")
+            return
+        }
+
+        val method = methods[0]
+        XposedBridge.hookMethod(method, object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val res = param.result ?: return
+                val resStr = res.toString()
+                if (resStr.contains("Tombstone") || resStr.contains("Admin")) {
+                    // Force the message to re-evaluate without the tombstone classification
+                    val arg = param.args.firstOrNull() ?: return
+                    clearUnsentFlags(arg)
+                    // If result has type property, set it or invoke normal fallback
+                    for (field in res.javaClass.declaredFields) {
+                        field.isAccessible = true
+                        val fVal = field.get(res)
+                        if (fVal is String && (fVal.contains("Tombstone") || fVal.contains("Admin"))) {
+                            field.set(res, "TextMessage")
+                            XposedBridge.log("$TAG: [Classifier] Overwrote tombstone type with TextMessage!")
+                        }
+                    }
+                }
+            }
+        })
+        XposedBridge.log("$TAG: [Classifier] Hooked ${method.declaringClass.name}.${method.name}")
+    }
+
+    /**
+     * Hook 2: MsysToGraphqlMessageListSnapshotAdapter (X.VIF.A0H).
      */
     private fun hookMsysAdapter(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
         val methods = Resolver.resolve(lp, modulePath, "msys_adapter", 1) { bridge ->
@@ -57,7 +102,7 @@ object MessengerHook {
                 val list = param.result as? List<*> ?: return
                 for (item in list) {
                     if (item == null) continue
-                    forceMessageActive(item)
+                    clearUnsentFlags(item)
                 }
             }
         })
@@ -65,7 +110,7 @@ object MessengerHook {
     }
 
     /**
-     * Hook 2: Modern Messenger E2EE (TAM / Armadillo) Mailbox unsend command.
+     * Hook 3: Modern Messenger E2EE (TAM / Armadillo) Mailbox unsend command.
      */
     private fun hookTamUnsend(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
         val methods = Resolver.resolve(lp, modulePath, "tam_unsend", 1) { bridge ->
@@ -93,7 +138,7 @@ object MessengerHook {
     }
 
     /**
-     * Hook 3: Minos / GraphQL Recall Delta Applicator.
+     * Hook 4: Minos / GraphQL Recall Delta Applicator.
      */
     private fun hookRecallDelta(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
         val methods = Resolver.resolve(lp, modulePath, "recall_delta", 1) { bridge ->
@@ -121,7 +166,7 @@ object MessengerHook {
     }
 
     /**
-     * Hook 4: UI Renderer isUnsent Check.
+     * Hook 5: UI Renderer isUnsent Check.
      */
     private fun hookUiMessageModel(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
         val methods = Resolver.resolve(lp, modulePath, "ui_msg_model", 1) { bridge ->
@@ -143,7 +188,7 @@ object MessengerHook {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 for (arg in param.args) {
                     if (arg == null) continue
-                    forceMessageActive(arg)
+                    clearUnsentFlags(arg)
                 }
             }
         })
@@ -151,9 +196,9 @@ object MessengerHook {
     }
 
     /**
-     * Helper to clear tombstone and isUnsent flags from any message model.
+     * Clear tombstone and isUnsent flags from any message model.
      */
-    private fun forceMessageActive(obj: Any) {
+    private fun clearUnsentFlags(obj: Any) {
         val clazz = obj.javaClass
         for (m in clazz.methods) {
             if (m.parameterCount == 0 && (m.returnType == Boolean::class.java || m.returnType == java.lang.Boolean.TYPE)) {
