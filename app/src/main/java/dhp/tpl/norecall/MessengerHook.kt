@@ -17,6 +17,7 @@ import java.util.LinkedHashMap
  */
 object MessengerHook {
 
+    const val TARGET = "com.facebook.orca"
     private const val TAG = Resolver.TAG
 
     // Cache message content by message ID: id -> text
