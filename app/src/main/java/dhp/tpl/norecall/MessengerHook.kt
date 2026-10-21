@@ -9,7 +9,7 @@ import java.lang.reflect.Constructor
 import java.lang.reflect.Method
 
 /**
- * Messenger Anti-Unsend / Anti-Recall Hook
+ * Messenger Anti-Unsend / Anti-Recall Hook with Detailed Debug Logging
  */
 object MessengerHook {
 
@@ -17,6 +17,7 @@ object MessengerHook {
     private const val TAG = Resolver.TAG
 
     fun install(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
+        XposedBridge.log("$TAG: Installing hooks for ${lp.packageName} (process: ${lp.processName})...")
         hookMessageTypeClassifier(lp, modulePath)
         hookMsysAdapter(lp, modulePath)
         hookTamUnsend(lp, modulePath)
@@ -26,9 +27,6 @@ object MessengerHook {
 
     /**
      * Hook 1: Message Type Classifier (X.55y.A00).
-     * Returns an instance of X.5Tm(typeString).
-     * If the classified type is TombstoneMessage or AdminMessage, we construct
-     * and return a new X.5Tm("TextMessage")!
      */
     private fun hookMessageTypeClassifier(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
         val methods = Resolver.resolve(lp, modulePath, "type_classifier", 1) { bridge ->
@@ -48,36 +46,37 @@ object MessengerHook {
         val method = methods[0]
         val returnType = method.returnType
 
-        // Cache the constructor of X.5Tm(String)
         var constructor: Constructor<*>? = null
         try {
             constructor = returnType.getDeclaredConstructor(String::class.java).apply {
                 isAccessible = true
             }
         } catch (t: Throwable) {
-            XposedBridge.log("$TAG: [Classifier] Could not find 5Tm(String) constructor: $t")
+            XposedBridge.log("$TAG: [Classifier] Constructor error: $t")
         }
 
         XposedBridge.hookMethod(method, object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 val res = param.result ?: return
                 val resStr = res.toString()
-                if (resStr.contains("Tombstone") || resStr.contains("Admin")) {
+                
+                // Detailed debug logging
+                if (resStr.contains("Tombstone") || resStr.contains("Admin") || resStr.contains("Unavailable")) {
+                    XposedBridge.log("$TAG: [Classifier-DEBUG] Intercepted classification: $resStr, arg: ${param.args.firstOrNull()}")
                     if (constructor != null) {
                         try {
                             param.result = constructor.newInstance("TextMessage")
-                            XposedBridge.log("$TAG: [Classifier] Successfully replaced TombstoneMessage result with TextMessage object!")
+                            XposedBridge.log("$TAG: [Classifier-DEBUG] Successfully returned new TextMessage object!")
                         } catch (t: Throwable) {
-                            XposedBridge.log("$TAG: [Classifier] Constructor instantiation failed: $t")
+                            XposedBridge.log("$TAG: [Classifier-DEBUG] Instantiation failed: $t")
                         }
                     } else {
-                        // Fallback: mutate field directly
                         for (field in res.javaClass.declaredFields) {
                             field.isAccessible = true
                             val fVal = field.get(res)
                             if (fVal is String) {
                                 field.set(res, "TextMessage")
-                                XposedBridge.log("$TAG: [Classifier] Mutated field ${field.name} to TextMessage")
+                                XposedBridge.log("$TAG: [Classifier-DEBUG] Mutated field ${field.name} to TextMessage")
                             }
                         }
                     }
@@ -109,6 +108,7 @@ object MessengerHook {
         XposedBridge.hookMethod(method, object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 val list = param.result as? List<*> ?: return
+                XposedBridge.log("$TAG: [Adapter-DEBUG] Processing snapshot of ${list.size} messages")
                 for (item in list) {
                     if (item == null) continue
                     clearUnsentFlags(item)
@@ -139,8 +139,9 @@ object MessengerHook {
         val method = methods[0]
         XposedBridge.hookMethod(method, object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
+                XposedBridge.log("$TAG: [TAM-DEBUG] runTamClientMessageUnsend CALLED! Args: ${param.args.joinToString()}")
                 param.result = null
-                XposedBridge.log("$TAG: [TAM] Intercepted & blocked runTamClientMessageUnsend!")
+                XposedBridge.log("$TAG: [TAM-DEBUG] Canceled execution.")
             }
         })
         XposedBridge.log("$TAG: [TAM] Hooked ${method.declaringClass.name}.${method.name}")
@@ -167,8 +168,9 @@ object MessengerHook {
         val method = methods[0]
         XposedBridge.hookMethod(method, object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
+                XposedBridge.log("$TAG: [Delta-DEBUG] Recall delta applicator CALLED! Args: ${param.args.joinToString()}")
                 param.result = null
-                XposedBridge.log("$TAG: [Delta] Intercepted & blocked recall delta applicator!")
+                XposedBridge.log("$TAG: [Delta-DEBUG] Canceled execution.")
             }
         })
         XposedBridge.log("$TAG: [Delta] Hooked ${method.declaringClass.name}.${method.name}")
@@ -204,9 +206,6 @@ object MessengerHook {
         XposedBridge.log("$TAG: [UI] Hooked ${method.declaringClass.name}.${method.name}")
     }
 
-    /**
-     * Clear tombstone and isUnsent flags from any message model.
-     */
     private fun clearUnsentFlags(obj: Any) {
         val clazz = obj.javaClass
         for (m in clazz.methods) {
@@ -216,6 +215,9 @@ object MessengerHook {
                     try {
                         XposedBridge.hookMethod(m, object : XC_MethodHook() {
                             override fun afterHookedMethod(p: MethodHookParam) {
+                                if (p.result == true) {
+                                    XposedBridge.log("$TAG: [Flag-DEBUG] Overrode $name() from true to false on ${clazz.simpleName}")
+                                }
                                 p.result = false
                             }
                         })

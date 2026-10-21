@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <queries>
+        <package android:name="com.facebook.orca" />
+        <package android:name="mrv.masked.com.facebook.orca" />
+    </queries>
     <application
         android:label="Messenger No Recall"
         android:allowBackup="false">
