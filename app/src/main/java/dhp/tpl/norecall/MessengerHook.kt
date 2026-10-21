@@ -14,8 +14,8 @@ import java.util.Collections
 import java.util.LinkedHashMap
 
 /**
- * Messenger Anti-Unsend / Anti-Recall Hook with Reverb Deleted Messages Scanner,
- * Multi-Key Identification, and Persistent Disk Cache.
+ * Messenger Anti-Unsend / Anti-Recall Hook with Original Media Restoration (v2.2),
+ * ThreadView Row Model Substitution, Reverb Scanner, and Multi-Key Disk Cache.
  */
 object MessengerHook {
 
@@ -24,7 +24,14 @@ object MessengerHook {
 
     private var cacheFile: File? = null
 
-    // Multi-key message cache: (ID, MID, timestamp, otid) -> text
+    // Live UI message model cache: (ID, MID, otid, timestamp) -> LX/6fq model instance (PhotoMessage, VideoMessage, StickerMessage, etc.)
+    private val rawModelCache = Collections.synchronizedMap(
+        object : LinkedHashMap<String, Any>(2000, 0.75f, true) {
+            override fun removeEldestEntry(eldest: Map.Entry<String, Any>): Boolean = size > 2000
+        }
+    )
+
+    // Multi-key message text cache: (ID, MID, timestamp, otid) -> text
     private val messageCache = Collections.synchronizedMap(
         object : LinkedHashMap<String, String>(10000, 0.75f, true) {
             override fun removeEldestEntry(eldest: Map.Entry<String, String>): Boolean = size > 10000
@@ -46,6 +53,8 @@ object MessengerHook {
 
         hookNotifications()
         hookMessageModels(lp, modulePath)
+        hookRowListBuilder(lp, modulePath)
+        hookMessageTypeClassifier(lp, modulePath)
         hookTombstoneModel(lp, modulePath)
     }
 
@@ -351,7 +360,9 @@ object MessengerHook {
     }
 
     /**
-     * Hook all message models (Text, Photo, Sticker, Video, Link).
+     * Hook all message models (Text, Photo, Sticker, Video, Audio, Document, Gif, Link).
+     * Caches the original live model instance into rawModelCache so it can be restored
+     * in the thread view UI when recalled.
      */
     private fun hookMessageModels(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
         hookSingleModel(lp, modulePath, "text_class", "[TextMessage text=") { instance, clazz ->
@@ -373,12 +384,24 @@ object MessengerHook {
             "📷 [Photo]"
         }
 
+        hookSingleModel(lp, modulePath, "video_class", "[VideoMessage videoAttachment=") { _, _ ->
+            "🎥 [Video]"
+        }
+
+        hookSingleModel(lp, modulePath, "document_class", "[DocumentMessage contentCount=") { _, _ ->
+            "📁 [File/Document]"
+        }
+
         hookSingleModel(lp, modulePath, "sticker_class", "[StickerMessage stickerId=") { _, _ ->
             "🏷️ [Sticker]"
         }
 
-        hookSingleModel(lp, modulePath, "video_class", "[VideoMessage videoAttachment=") { _, _ ->
-            "🎥 [Video]"
+        hookSingleModel(lp, modulePath, "audio_class", "[AudioMessage uri=") { _, _ ->
+            "🎵 [Voice/Audio]"
+        }
+
+        hookSingleModel(lp, modulePath, "gif_class", "[LocalGifMessage photoMessage=") { _, _ ->
+            "👾 [GIF]"
         }
 
         hookSingleModel(lp, modulePath, "xma_class", "[XmaMessage title=") { _, _ ->
@@ -414,11 +437,14 @@ object MessengerHook {
                     try {
                         val ids = extractAllIdentifiers(instance)
                         val text = extractText(instance, modelClass)
-                        if (ids.isNotEmpty() && text != null) {
+                        if (ids.isNotEmpty()) {
                             for (id in ids) {
-                                putMessage(id, text)
+                                rawModelCache[id] = instance
+                                if (text != null) {
+                                    putMessage(id, text)
+                                }
                             }
-                            XposedBridge.log("$TAG: [Cache] Saved message (ids=$ids): '$text'")
+                            XposedBridge.log("$TAG: [Cache] Saved ${modelClass.simpleName} model (ids=$ids): '$text'")
                         }
                     } catch (t: Throwable) {
                         XposedBridge.log("$TAG: [$cacheKey] Error caching: $t")
@@ -430,9 +456,134 @@ object MessengerHook {
     }
 
     /**
+     * Hook ThreadView Row List Builder (LX/5LR.A00).
+     * Replaces TombstoneMessage items in the message list with the original cached
+     * PhotoMessage / VideoMessage / StickerMessage / DocumentMessage models so Litho
+     * renders the actual original photo, video, or attachment!
+     */
+    private fun hookRowListBuilder(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
+        val methods = Resolver.resolve(lp, modulePath, "row_builder", 1) { bridge ->
+            val results = bridge.findMethod {
+                matcher {
+                    usingStrings(".*@\\[00:00\\d].*")
+                }
+            }
+            if (results.isEmpty()) {
+                bridge.findMethod {
+                    matcher {
+                        usingStrings("unexpected active typing stats in typing user status map")
+                    }
+                }
+            } else {
+                listOf(results.first())
+            }
+        }
+
+        if (methods == null || methods.isEmpty()) {
+            XposedBridge.log("$TAG: [RowBuilder] Row builder method not found via DexKit")
+            return
+        }
+
+        val method = methods[0]
+        XposedBridge.hookMethod(method, object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                try {
+                    for (i in param.args.indices) {
+                        val list = param.args[i] as? List<*> ?: continue
+                        if (list.isEmpty()) continue
+
+                        var hasTombstone = false
+                        for (item in list) {
+                            if (item != null && (item.javaClass.name.contains("5OO") || item.toString().contains("TombstoneMessage"))) {
+                                hasTombstone = true
+                                break
+                            }
+                        }
+                        if (!hasTombstone) continue
+
+                        var modified = false
+                        val newList = ArrayList<Any?>(list.size)
+                        for (item in list) {
+                            if (item != null && (item.javaClass.name.contains("5OO") || item.toString().contains("TombstoneMessage"))) {
+                                val ids = extractAllIdentifiers(item)
+                                var replacement: Any? = null
+                                for (id in ids) {
+                                    val cached = rawModelCache[id]
+                                    if (cached != null) {
+                                        replacement = cached
+                                        break
+                                    }
+                                }
+                                if (replacement != null) {
+                                    newList.add(replacement)
+                                    modified = true
+                                    XposedBridge.log("$TAG: [RowBuilder] Restored original ${replacement.javaClass.simpleName} in place of Tombstone (ids=$ids)")
+                                    continue
+                                }
+                            }
+                            newList.add(item)
+                        }
+
+                        if (modified) {
+                            param.args[i] = newList
+                        }
+                    }
+                } catch (t: Throwable) {
+                    XposedBridge.log("$TAG: [RowBuilder] Error substituting models: $t")
+                }
+            }
+        })
+        XposedBridge.log("$TAG: [RowBuilder] Hooked ${method.declaringClass.name}.${method.name}")
+    }
+
+    /**
+     * Hook Message Type Classifier (LX/55y.A00).
+     * When Messenger classifies a message type for rendering, if it encounters a TombstoneMessage
+     * that has a cached media model, swap it so the classifier returns the Photo/Video/Sticker type.
+     */
+    private fun hookMessageTypeClassifier(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
+        val methods = Resolver.resolve(lp, modulePath, "type_classifier", 1) { bridge ->
+            val results = bridge.findMethod {
+                matcher {
+                    usingStrings("TombstoneMessage", "TextMessage", "PhotoMessage")
+                }
+            }
+            if (results.isEmpty()) null else listOf(results.first())
+        }
+
+        if (methods == null || methods.isEmpty()) {
+            XposedBridge.log("$TAG: [Classifier] Classifier method not found via DexKit")
+            return
+        }
+
+        val method = methods[0]
+        XposedBridge.hookMethod(method, object : XC_MethodHook() {
+            override fun beforeHookedMethod(param: MethodHookParam) {
+                try {
+                    val arg = param.args.firstOrNull() ?: return
+                    if (arg.javaClass.name.contains("5OO") || arg.toString().contains("TombstoneMessage")) {
+                        val ids = extractAllIdentifiers(arg)
+                        for (id in ids) {
+                            val cached = rawModelCache[id]
+                            if (cached != null) {
+                                param.args[0] = cached
+                                XposedBridge.log("$TAG: [Classifier] Swapped Tombstone arg with ${cached.javaClass.simpleName} (id=$id)")
+                                break
+                            }
+                        }
+                    }
+                } catch (t: Throwable) {
+                    XposedBridge.log("$TAG: [Classifier] Error: $t")
+                }
+            }
+        })
+        XposedBridge.log("$TAG: [Classifier] Hooked ${method.declaringClass.name}.${method.name}")
+    }
+
+    /**
      * Hook TombstoneMessage Constructor.
      * Intercepts recalled messages, looks up original text across all identifiers,
-     * and replaces snippet with the recovered message.
+     * and replaces snippet with the recovered message (as fallback when raw model is not available).
      */
     private fun hookTombstoneModel(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
         val tombstoneClass = Resolver.resolveClass(lp, modulePath, "tombstone_class") { bridge ->
