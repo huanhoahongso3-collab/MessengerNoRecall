@@ -5,18 +5,11 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import org.luckypray.dexkit.DexKitBridge
 import org.luckypray.dexkit.result.MethodData
+import java.lang.reflect.Constructor
 import java.lang.reflect.Method
 
 /**
  * Messenger Anti-Unsend / Anti-Recall Hook
- *
- * Intercepts:
- * 1. UI message type classifier (X.55y.A00): Prevents any message from being converted
- *    into a TombstoneMessage / AdminMessage type when unsent!
- * 2. MsysToGraphqlMessageListSnapshotAdapter (X.VIF.A0H): Prevents messages from being
- *    flagged as is_unsent in the CQL message list.
- * 3. TAM / Armadillo / E2EE Mailbox client unsend (X.20l.A06): Prevents local database deletion.
- * 4. Minos / GraphQL recall delta applicator (X.8FS.A00): Blocks recall pushes.
  */
 object MessengerHook {
 
@@ -33,11 +26,9 @@ object MessengerHook {
 
     /**
      * Hook 1: Message Type Classifier (X.55y.A00).
-     * Maps message data into rendering types: TextMessage, PhotoMessage, TombstoneMessage, etc.
-     * If a message is recalled, Messenger tries to return TombstoneMessage or AdminMessage.
-     * We intercept afterHookedMethod and check the returned model / type:
-     * If it is a TombstoneMessage or its string representation contains "Tombstone",
-     * we inspect the underlying message data (param.args[0]) and return the normal Text/Media type!
+     * Returns an instance of X.5Tm(typeString).
+     * If the classified type is TombstoneMessage or AdminMessage, we construct
+     * and return a new X.5Tm("TextMessage")!
      */
     private fun hookMessageTypeClassifier(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
         val methods = Resolver.resolve(lp, modulePath, "type_classifier", 1) { bridge ->
@@ -55,21 +46,39 @@ object MessengerHook {
         }
 
         val method = methods[0]
+        val returnType = method.returnType
+
+        // Cache the constructor of X.5Tm(String)
+        var constructor: Constructor<*>? = null
+        try {
+            constructor = returnType.getDeclaredConstructor(String::class.java).apply {
+                isAccessible = true
+            }
+        } catch (t: Throwable) {
+            XposedBridge.log("$TAG: [Classifier] Could not find 5Tm(String) constructor: $t")
+        }
+
         XposedBridge.hookMethod(method, object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 val res = param.result ?: return
                 val resStr = res.toString()
                 if (resStr.contains("Tombstone") || resStr.contains("Admin")) {
-                    // Force the message to re-evaluate without the tombstone classification
-                    val arg = param.args.firstOrNull() ?: return
-                    clearUnsentFlags(arg)
-                    // If result has type property, set it or invoke normal fallback
-                    for (field in res.javaClass.declaredFields) {
-                        field.isAccessible = true
-                        val fVal = field.get(res)
-                        if (fVal is String && (fVal.contains("Tombstone") || fVal.contains("Admin"))) {
-                            field.set(res, "TextMessage")
-                            XposedBridge.log("$TAG: [Classifier] Overwrote tombstone type with TextMessage!")
+                    if (constructor != null) {
+                        try {
+                            param.result = constructor.newInstance("TextMessage")
+                            XposedBridge.log("$TAG: [Classifier] Successfully replaced TombstoneMessage result with TextMessage object!")
+                        } catch (t: Throwable) {
+                            XposedBridge.log("$TAG: [Classifier] Constructor instantiation failed: $t")
+                        }
+                    } else {
+                        // Fallback: mutate field directly
+                        for (field in res.javaClass.declaredFields) {
+                            field.isAccessible = true
+                            val fVal = field.get(res)
+                            if (fVal is String) {
+                                field.set(res, "TextMessage")
+                                XposedBridge.log("$TAG: [Classifier] Mutated field ${field.name} to TextMessage")
+                            }
                         }
                     }
                 }
