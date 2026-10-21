@@ -13,33 +13,29 @@ import java.util.Collections
 import java.util.LinkedHashMap
 
 /**
- * Messenger Anti-Unsend / Anti-Recall Hook with Persistent Disk Cache
- * and Local SQLite Database Scanner.
+ * Messenger Anti-Unsend / Anti-Recall Hook with Multi-Identifier Indexing,
+ * SQLite Full Database Scanner, and Robust Group/Direct Notification Matching.
  */
 object MessengerHook {
 
     const val TARGET = "com.facebook.orca"
     private const val TAG = Resolver.TAG
 
-    // Persistent cache file on disk
     private var cacheFile: File? = null
 
-    // Message ID -> text (e.g. "410801359" -> "Hello")
+    // Multi-key message cache: (ID, MID, timestamp, otid) -> text
     private val messageCache = Collections.synchronizedMap(
-        object : LinkedHashMap<String, String>(2000, 0.75f, true) {
-            override fun removeEldestEntry(eldest: Map.Entry<String, String>): Boolean = size > 2000
+        object : LinkedHashMap<String, String>(5000, 0.75f, true) {
+            override fun removeEldestEntry(eldest: Map.Entry<String, String>): Boolean = size > 5000
         }
     )
 
-    // Sender name -> latest text (e.g. "Hồng Phúc" -> "Hello")
+    // Sender -> latest message text (e.g. "Hồng Phúc" -> "Hello")
     private val notifCache = Collections.synchronizedMap(
-        object : LinkedHashMap<String, String>(200, 0.75f, true) {
-            override fun removeEldestEntry(eldest: Map.Entry<String, String>): Boolean = size > 200
+        object : LinkedHashMap<String, String>(500, 0.75f, true) {
+            override fun removeEldestEntry(eldest: Map.Entry<String, String>): Boolean = size > 500
         }
     )
-
-    // Matches both numeric IDs (410801359) and MIDs (mid.$gAB...)
-    private val idRegex = Regex("""\bid=([^, \]]+)""")
 
     fun install(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
         XposedBridge.log("$TAG: Installing anti-unsend hooks for ${lp.packageName} (process: ${lp.processName})...")
@@ -72,7 +68,7 @@ object MessengerHook {
                         notifCache[key] = notifObj.getString(key)
                     }
                 }
-                XposedBridge.log("$TAG: [DiskCache] Loaded ${messageCache.size} messages, ${notifCache.size} sender entries from disk")
+                XposedBridge.log("$TAG: [DiskCache] Loaded ${messageCache.size} messages, ${notifCache.size} notifs from disk")
             }
         } catch (t: Throwable) {
             XposedBridge.log("$TAG: [DiskCache] Failed to load cache: $t")
@@ -123,8 +119,8 @@ object MessengerHook {
     }
 
     /**
-     * Scan Messenger local SQLite databases (threads_db2, msys_database, etc.)
-     * to pre-load any messages currently stored on disk.
+     * Scan Messenger local SQLite databases (msys_database, threads_db2, etc.)
+     * and index EVERY message by all its identifier columns (message_id, otid, timestamp_ms).
      */
     private fun scanLocalDatabases(lp: XC_LoadPackage.LoadPackageParam) {
         try {
@@ -133,10 +129,10 @@ object MessengerHook {
             val files = dbDir.listFiles() ?: return
 
             for (file in files) {
-                if (!file.isFile) continue
+                if (!file.isFile || file.length() < 1024) continue
                 val name = file.name
                 if (name.endsWith("-wal") || name.endsWith("-journal") || name.endsWith("-shm")) continue
-                if (!name.contains("threads") && !name.contains("msys") && !name.endsWith(".db")) continue
+                if (!name.contains("msys") && !name.contains("threads") && !name.endsWith(".db")) continue
 
                 try {
                     val db = SQLiteDatabase.openDatabase(file.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
@@ -157,34 +153,58 @@ object MessengerHook {
                         }
                         colCursor.close()
 
-                        val idCol = cols.firstOrNull {
-                            it.equals("message_id", ignoreCase = true) ||
-                            it.equals("mid", ignoreCase = true) ||
-                            it.equals("id", ignoreCase = true)
-                        }
-                        val textCol = cols.firstOrNull {
+                        XposedBridge.log("$TAG: [DB] Inspecting table ${file.name}.$table (columns: $cols)")
+
+                        val textCols = cols.filter {
                             it.equals("text", ignoreCase = true) ||
                             it.equals("body", ignoreCase = true) ||
-                            it.equals("snippet", ignoreCase = true)
+                            it.equals("snippet", ignoreCase = true) ||
+                            it.equals("message_text", ignoreCase = true)
+                        }
+                        if (textCols.isEmpty()) continue
+
+                        val idCols = cols.filter {
+                            it.contains("id", ignoreCase = true) ||
+                            it.contains("mid", ignoreCase = true) ||
+                            it.contains("otid", ignoreCase = true) ||
+                            it.contains("timestamp", ignoreCase = true) ||
+                            it.contains("time", ignoreCase = true)
                         }
 
-                        if (idCol != null && textCol != null) {
-                            var count = 0
-                            val q = db.rawQuery("SELECT $idCol, $textCol FROM $table WHERE $textCol IS NOT NULL", null)
-                            while (q.moveToNext()) {
-                                val id = q.getString(0)
-                                val text = q.getString(1)
-                                if (!id.isNullOrBlank() && !text.isNullOrBlank() &&
-                                    !text.contains("deleted a message", ignoreCase = true) &&
-                                    !text.contains("đã thu hồi", ignoreCase = true)) {
-                                    messageCache[id] = text
-                                    count++
+                        val q = db.rawQuery("SELECT * FROM $table", null)
+                        val colNames = q.columnNames
+                        var count = 0
+                        while (q.moveToNext()) {
+                            var textVal: String? = null
+                            for (tc in textCols) {
+                                val idx = q.getColumnIndex(tc)
+                                if (idx != -1 && !q.isNull(idx)) {
+                                    val v = q.getString(idx)
+                                    if (!v.isNullOrBlank() &&
+                                        !v.contains("deleted a message", ignoreCase = true) &&
+                                        !v.contains("đã thu hồi", ignoreCase = true)) {
+                                        textVal = v
+                                        break
+                                    }
                                 }
                             }
-                            q.close()
-                            if (count > 0) {
-                                XposedBridge.log("$TAG: [DB] Pre-loaded $count messages from ${file.name}.$table ($idCol, $textCol)")
+                            if (textVal == null) continue
+
+                            // Map all identifier columns to this text
+                            for (ic in idCols) {
+                                val idx = q.getColumnIndex(ic)
+                                if (idx != -1 && !q.isNull(idx)) {
+                                    val v = q.getString(idx)
+                                    if (!v.isNullOrBlank() && v != textVal) {
+                                        messageCache[v] = textVal
+                                    }
+                                }
                             }
+                            count++
+                        }
+                        q.close()
+                        if (count > 0) {
+                            XposedBridge.log("$TAG: [DB] Pre-loaded and multi-indexed $count messages from ${file.name}.$table")
                         }
                     }
                     db.close()
@@ -201,8 +221,7 @@ object MessengerHook {
     }
 
     /**
-     * Intercept system notifications posted by Messenger to capture message content
-     * including full text from MessagingStyle and BigText.
+     * Intercept system notifications to capture message content before chat opens.
      */
     private fun hookNotifications() {
         try {
@@ -226,10 +245,16 @@ object MessengerHook {
 
                             if (!title.isNullOrBlank() && !resolvedText.isNullOrBlank()) {
                                 putNotif(title, resolvedText)
+                                // Also index under sender name after colon for group chats (e.g. "Group: Sender")
+                                if (title.contains(": ")) {
+                                    val individualSender = title.substringAfter(": ").trim()
+                                    if (individualSender.isNotEmpty()) {
+                                        putNotif(individualSender, resolvedText)
+                                    }
+                                }
                                 XposedBridge.log("$TAG: [Notif] Cached message from '$title': '$resolvedText'")
                             }
 
-                            // Extract messages array if MessagingStyle is used
                             val messagesArray = extras.getParcelableArray(Notification.EXTRA_MESSAGES)
                             if (messagesArray != null) {
                                 for (msgObj in messagesArray) {
@@ -254,7 +279,7 @@ object MessengerHook {
     }
 
     /**
-     * Hook all message models (Text, Photo, Sticker, Video, Link) to cache their content.
+     * Hook all message models (Text, Photo, Sticker, Video, Link).
      */
     private fun hookMessageModels(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
         hookSingleModel(lp, modulePath, "text_class", "[TextMessage text=") { instance, clazz ->
@@ -315,11 +340,13 @@ object MessengerHook {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val instance = param.thisObject ?: return
                     try {
-                        val id = extractMessageId(instance)
+                        val ids = extractAllIdentifiers(instance)
                         val text = extractText(instance, modelClass)
-                        if (id != null && text != null) {
-                            putMessage(id, text)
-                            XposedBridge.log("$TAG: [Cache] Saved message (id=$id): '$text'")
+                        if (ids.isNotEmpty() && text != null) {
+                            for (id in ids) {
+                                putMessage(id, text)
+                            }
+                            XposedBridge.log("$TAG: [Cache] Saved message (ids=$ids): '$text'")
                         }
                     } catch (t: Throwable) {
                         XposedBridge.log("$TAG: [$cacheKey] Error caching: $t")
@@ -332,7 +359,8 @@ object MessengerHook {
 
     /**
      * Hook TombstoneMessage Constructor.
-     * Intercepts deleted/recalled message rendering and replaces snippet with original text.
+     * Intercepts recalled messages, looks up original text across all identifiers,
+     * and replaces snippet with the recovered message.
      */
     private fun hookTombstoneModel(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
         val tombstoneClass = Resolver.resolveClass(lp, modulePath, "tombstone_class") { bridge ->
@@ -354,18 +382,36 @@ object MessengerHook {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val instance = param.thisObject ?: return
                     try {
-                        val id = extractMessageId(instance)
+                        val ids = extractAllIdentifiers(instance)
                         for (field in tombstoneClass.declaredFields) {
                             if (field.type == String::class.java) {
                                 field.isAccessible = true
                                 val oldSnippet = field.get(instance) as? String ?: continue
                                 if (oldSnippet.startsWith("🔴 [Recalled]")) break
 
-                                val cachedText = if (id != null) messageCache[id] else null
-                                val sender = oldSnippet.substringBefore(" deleted")
+                                // Look up cached text by all possible candidate keys
+                                var cachedText: String? = null
+                                for (id in ids) {
+                                    val t = messageCache[id]
+                                    if (t != null) {
+                                        cachedText = t
+                                        break
+                                    }
+                                }
+
+                                val sender = oldSnippet
+                                    .substringBefore(" deleted")
                                     .substringBefore(" đã thu hồi")
+                                    .substringBefore(" removed")
+                                    .substringBefore(" recalled")
                                     .trim()
-                                val notif = if (sender.isNotEmpty()) notifCache[sender] else null
+
+                                // If not found by ID, look up by sender in notification cache
+                                val notif = if (sender.isNotEmpty()) {
+                                    notifCache[sender] ?: notifCache.entries.firstOrNull {
+                                        it.key.contains(sender, ignoreCase = true)
+                                    }?.value
+                                } else null
 
                                 val newSnippet = when {
                                     cachedText != null -> "🔴 [Recalled]: $cachedText"
@@ -374,7 +420,7 @@ object MessengerHook {
                                 }
 
                                 field.set(instance, newSnippet)
-                                XposedBridge.log("$TAG: [TombstoneModel] Intercepted tombstone (id=$id, sender='$sender'): '$oldSnippet' -> '$newSnippet'")
+                                XposedBridge.log("$TAG: [TombstoneModel] Intercepted tombstone (ids=$ids, sender='$sender'): '$oldSnippet' -> '$newSnippet'")
                                 break
                             }
                         }
@@ -443,19 +489,51 @@ object MessengerHook {
         XposedBridge.log("$TAG: [Delta] Hooked ${method.declaringClass.name}.${method.name}")
     }
 
-    private fun extractMessageId(instance: Any): String? {
+    /**
+     * Recursively extracts all identifiers (id, timeSent, MIDs, strings, longs) from a model object.
+     */
+    private fun extractAllIdentifiers(instance: Any): Set<String> {
+        val ids = mutableSetOf<String>()
         val str = instance.toString()
-        val match = idRegex.find(str)
-        if (match != null) return match.groupValues[1]
 
-        for (field in instance.javaClass.declaredFields) {
-            try {
-                field.isAccessible = true
-                val value = field.get(instance) ?: continue
-                val fieldMatch = idRegex.find(value.toString())
-                if (fieldMatch != null) return fieldMatch.groupValues[1]
-            } catch (_: Throwable) {}
+        val idMatch = Regex("""\bid=([^, \]]+)""").find(str)
+        if (idMatch != null) ids.add(idMatch.groupValues[1])
+
+        val timeMatch = Regex("""\btimeSent=(\d+)""").find(str)
+        if (timeMatch != null) ids.add(timeMatch.groupValues[1])
+
+        fun inspectObj(obj: Any?, depth: Int) {
+            if (obj == null || depth > 2) return
+            val clazz = obj.javaClass
+            val cName = clazz.name
+            if (cName.startsWith("java.lang.String") || cName.startsWith("android.")) return
+
+            for (field in clazz.declaredFields) {
+                try {
+                    field.isAccessible = true
+                    val v = field.get(obj) ?: continue
+                    when (v) {
+                        is String -> {
+                            if (v.length in 4..64 && (v.all { it.isDigit() } || v.startsWith("mid.") || v.startsWith("mid$") || v.startsWith("m_"))) {
+                                ids.add(v)
+                            }
+                        }
+                        is Long -> {
+                            if (v > 1000000000000L) { // timestamp in ms (e.g. 1792577774743)
+                                ids.add(v.toString())
+                            }
+                        }
+                        else -> {
+                            if (depth < 2 && !v.javaClass.isPrimitive && !v.javaClass.isArray) {
+                                inspectObj(v, depth + 1)
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {}
+            }
         }
-        return null
+
+        inspectObj(instance, 0)
+        return ids
     }
 }
