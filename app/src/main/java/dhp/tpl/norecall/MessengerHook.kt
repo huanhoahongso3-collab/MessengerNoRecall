@@ -9,11 +9,13 @@ import java.lang.reflect.Method
 
 /**
  * Messenger Anti-Unsend / Anti-Recall Hook
- * 
+ *
  * Intercepts:
- * 1. TAM / Armadillo / E2EE Mailbox client unsend (`runTamClientMessageUnsend`)
- * 2. Minos / GraphQL recall delta applicator (`FbnMICoreGqlRecallMessageDeltaApplicatorFactory`)
- * 3. Message UI renderer (`isUnsent` / `adminMessageType` resolution)
+ * 1. MsysToGraphqlMessageListSnapshotAdapter: forces `is_unsent` in the CQL message list to false/null
+ *    so recalling messages never hides the text or switches to tombstone.
+ * 2. TAM / Armadillo / E2EE Mailbox client unsend (`runTamClientMessageUnsend`)
+ * 3. Minos / GraphQL recall delta applicator (`FbnMICoreGqlRecallMessageDeltaApplicatorFactory`)
+ * 4. Message UI renderer model (`isUnsent` checks)
  */
 object MessengerHook {
 
@@ -21,15 +23,49 @@ object MessengerHook {
     private const val TAG = Resolver.TAG
 
     fun install(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
+        hookMsysAdapter(lp, modulePath)
         hookTamUnsend(lp, modulePath)
         hookRecallDelta(lp, modulePath)
         hookUiMessageModel(lp, modulePath)
     }
 
     /**
-     * Hook 1: Modern Messenger E2EE (TAM / Armadillo) Mailbox unsend command.
-     * When a sender unsends, this method executes the local deletion in Mailbox.
-     * Canceling this prevents the message from being removed or replaced with tombstone locally!
+     * Hook 1: MsysToGraphqlMessageListSnapshotAdapter.
+     * When messages are loaded from SQLite / Mailbox into the GraphQL model for display,
+     * this adapter reads the flat CQL table.
+     * We hook the adapter and force any message marked with isUnsent back to false,
+     * restoring its original text, photo, audio, and attachments!
+     */
+    private fun hookMsysAdapter(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
+        val methods = Resolver.resolve(lp, modulePath, "msys_adapter", 1) { bridge ->
+            val results = bridge.findMethod {
+                matcher {
+                    usingStrings("MsysToGraphqlMessageListSnapshotAdapter.convertFlatMessagesToGraphqlModel")
+                }
+            }
+            if (results.isEmpty()) null else listOf(results.first())
+        }
+
+        if (methods == null) {
+            XposedBridge.log("$TAG: [Adapter] Msys adapter not found")
+            return
+        }
+
+        val method = methods[0]
+        XposedBridge.hookMethod(method, object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                val list = param.result as? List<*> ?: return
+                for (item in list) {
+                    if (item == null) continue
+                    forceMessageActive(item)
+                }
+            }
+        })
+        XposedBridge.log("$TAG: [Adapter] Hooked ${method.declaringClass.name}.${method.name}")
+    }
+
+    /**
+     * Hook 2: Modern Messenger E2EE (TAM / Armadillo) Mailbox unsend command.
      */
     private fun hookTamUnsend(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
         val methods = Resolver.resolve(lp, modulePath, "tam_unsend", 1) { bridge ->
@@ -49,7 +85,6 @@ object MessengerHook {
         val method = methods[0]
         XposedBridge.hookMethod(method, object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
-                // Cancel local execution of TAM unsend!
                 param.result = null
                 XposedBridge.log("$TAG: [TAM] Intercepted & blocked runTamClientMessageUnsend!")
             }
@@ -58,8 +93,7 @@ object MessengerHook {
     }
 
     /**
-     * Hook 2: Minos / GraphQL Recall Delta Applicator.
-     * Handles traditional / cloud message recall payloads.
+     * Hook 3: Minos / GraphQL Recall Delta Applicator.
      */
     private fun hookRecallDelta(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
         val methods = Resolver.resolve(lp, modulePath, "recall_delta", 1) { bridge ->
@@ -87,8 +121,7 @@ object MessengerHook {
     }
 
     /**
-     * Hook 3: UI Renderer isUnsent Check.
-     * Forces `isUnsent` checks to false so UI doesn't render tombstone view for any message.
+     * Hook 4: UI Renderer isUnsent Check.
      */
     private fun hookUiMessageModel(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
         val methods = Resolver.resolve(lp, modulePath, "ui_msg_model", 1) { bridge ->
@@ -110,23 +143,31 @@ object MessengerHook {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 for (arg in param.args) {
                     if (arg == null) continue
-                    for (m in arg.javaClass.methods) {
-                        if (m.parameterCount == 0 && (m.returnType == Boolean::class.java || m.returnType == java.lang.Boolean.TYPE)) {
-                            val name = m.name.lowercase()
-                            if (name.contains("unsent") || name.contains("tombstone")) {
-                                try {
-                                    XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                                        override fun afterHookedMethod(p: MethodHookParam) {
-                                            p.result = false
-                                        }
-                                    })
-                                } catch (_: Throwable) {}
-                            }
-                        }
-                    }
+                    forceMessageActive(arg)
                 }
             }
         })
         XposedBridge.log("$TAG: [UI] Hooked ${method.declaringClass.name}.${method.name}")
+    }
+
+    /**
+     * Helper to clear tombstone and isUnsent flags from any message model.
+     */
+    private fun forceMessageActive(obj: Any) {
+        val clazz = obj.javaClass
+        for (m in clazz.methods) {
+            if (m.parameterCount == 0 && (m.returnType == Boolean::class.java || m.returnType == java.lang.Boolean.TYPE)) {
+                val name = m.name.lowercase()
+                if (name.contains("unsent") || name.contains("tombstone")) {
+                    try {
+                        XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                            override fun afterHookedMethod(p: MethodHookParam) {
+                                p.result = false
+                            }
+                        })
+                    } catch (_: Throwable) {}
+                }
+            }
+        }
     }
 }
