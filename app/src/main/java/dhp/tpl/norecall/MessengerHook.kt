@@ -47,8 +47,6 @@ object MessengerHook {
         hookNotifications()
         hookMessageModels(lp, modulePath)
         hookTombstoneModel(lp, modulePath)
-        hookTamUnsend(lp, modulePath)
-        hookRecallDelta(lp, modulePath)
     }
 
     private fun initPersistentCache(lp: XC_LoadPackage.LoadPackageParam) {
@@ -503,62 +501,6 @@ object MessengerHook {
             })
         }
         XposedBridge.log("$TAG: [TombstoneModel] Hooked ${tombstoneClass.name} constructors")
-    }
-
-    /**
-     * Modern Messenger E2EE (TAM / Armadillo) Mailbox unsend command.
-     */
-    private fun hookTamUnsend(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
-        val methods = Resolver.resolve(lp, modulePath, "tam_unsend", 1) { bridge ->
-            val results = bridge.findMethod {
-                matcher {
-                    usingStrings("runTamClientMessageUnsend")
-                }
-            }
-            if (results.isEmpty()) null else listOf(results.first())
-        }
-
-        if (methods == null) {
-            XposedBridge.log("$TAG: [TAM] runTamClientMessageUnsend not found")
-            return
-        }
-
-        val method = methods[0]
-        XposedBridge.hookMethod(method, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                param.result = null
-                XposedBridge.log("$TAG: [TAM] Intercepted & blocked runTamClientMessageUnsend!")
-            }
-        })
-        XposedBridge.log("$TAG: [TAM] Hooked ${method.declaringClass.name}.${method.name}")
-    }
-
-    /**
-     * Minos / GraphQL Recall Delta Applicator.
-     */
-    private fun hookRecallDelta(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
-        val methods = Resolver.resolve(lp, modulePath, "recall_delta", 1) { bridge ->
-            val results = bridge.findMethod {
-                matcher {
-                    usingStrings("applyMinosServerDeltas", "recallDeltaApplicator")
-                }
-            }
-            if (results.isEmpty()) null else listOf(results.first())
-        }
-
-        if (methods == null) {
-            XposedBridge.log("$TAG: [Delta] Recall delta applicator not found")
-            return
-        }
-
-        val method = methods[0]
-        XposedBridge.hookMethod(method, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                param.result = null
-                XposedBridge.log("$TAG: [Delta] Intercepted & blocked recall delta applicator!")
-            }
-        })
-        XposedBridge.log("$TAG: [Delta] Hooked ${method.declaringClass.name}.${method.name}")
     }
 
     /**
