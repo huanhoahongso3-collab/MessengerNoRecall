@@ -12,10 +12,14 @@ import org.json.JSONObject
 import java.io.File
 import java.util.Collections
 import java.util.LinkedHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Messenger Anti-Unsend / Anti-Recall Hook with Original Media Restoration (v2.2),
- * ThreadView Row Model Substitution, Reverb Scanner, and Multi-Key Disk Cache.
+ * Messenger Anti-Unsend / Anti-Recall Hook with Original Media Restoration (v2.3),
+ * Asynchronous Debounced Disk Persistence, Zero-Allocation Identifier Extraction,
+ * and Non-Blocking UI Pipeline.
  */
 object MessengerHook {
 
@@ -23,6 +27,10 @@ object MessengerHook {
     private const val TAG = Resolver.TAG
 
     private var cacheFile: File? = null
+    @Volatile private var tombstoneClass: Class<*>? = null
+
+    private val diskExecutor = Executors.newSingleThreadScheduledExecutor()
+    private val saveScheduled = AtomicBoolean(false)
 
     // Live UI message model cache: (ID, MID, otid, timestamp) -> LX/6fq model instance (PhotoMessage, VideoMessage, StickerMessage, etc.)
     private val rawModelCache = Collections.synchronizedMap(
@@ -49,7 +57,14 @@ object MessengerHook {
         XposedBridge.log("$TAG: Installing anti-unsend hooks for ${lp.packageName} (process: ${lp.processName})...")
 
         initPersistentCache(lp)
-        scanLocalDatabases(lp)
+
+        // Run database scan in background so Messenger startup and outgoing message dispatch are never blocked
+        Thread({
+            try {
+                Thread.sleep(2000)
+                scanLocalDatabases(lp)
+            } catch (_: Throwable) {}
+        }, "NoUnsent-DbScanner").start()
 
         hookNotifications()
         hookMessageModels(lp, modulePath)
@@ -83,7 +98,15 @@ object MessengerHook {
         }
     }
 
-    @Synchronized
+    private fun scheduleDiskSave() {
+        if (saveScheduled.compareAndSet(false, true)) {
+            diskExecutor.schedule({
+                saveScheduled.set(false)
+                saveToDisk()
+            }, 3, TimeUnit.SECONDS)
+        }
+    }
+
     private fun saveToDisk() {
         try {
             val file = cacheFile ?: return
@@ -104,7 +127,9 @@ object MessengerHook {
             }
             json.put("notifs", notifObj)
 
-            file.writeText(json.toString())
+            val tmpFile = File(file.parentFile, "${file.name}.tmp")
+            tmpFile.writeText(json.toString())
+            tmpFile.renameTo(file)
         } catch (t: Throwable) {
             XposedBridge.log("$TAG: [DiskCache] Failed to save cache: $t")
         }
@@ -114,7 +139,7 @@ object MessengerHook {
         if (id.isBlank() || text.isBlank()) return
         val prev = messageCache.put(id, text)
         if (prev != text) {
-            saveToDisk()
+            scheduleDiskSave()
         }
     }
 
@@ -122,12 +147,12 @@ object MessengerHook {
         if (sender.isBlank() || text.isBlank()) return
         val prev = notifCache.put(sender, text)
         if (prev != text) {
-            saveToDisk()
+            scheduleDiskSave()
         }
     }
 
     /**
-     * Scan Messenger local SQLite databases including reverb_db (which stores deleted messages!),
+     * Scan Messenger local SQLite databases in background including reverb_db (which stores deleted messages!),
      * msys_database, and threads_db2.
      */
     private fun scanLocalDatabases(lp: XC_LoadPackage.LoadPackageParam) {
@@ -152,7 +177,6 @@ object MessengerHook {
                     cursor.close()
 
                     for (table in tables) {
-                        // Scan reverb_db tables (where deleted messages are stored!)
                         if (name.contains("reverb")) {
                             scanReverbTable(file.name, db, table)
                             continue
@@ -223,7 +247,7 @@ object MessengerHook {
                 }
             }
             if (messageCache.isNotEmpty()) {
-                saveToDisk()
+                scheduleDiskSave()
             }
         } catch (t: Throwable) {
             XposedBridge.log("$TAG: [DB] Database scan error: $t")
@@ -259,7 +283,6 @@ object MessengerHook {
                     messageCache[otid] = text
                     if (!ts.isNullOrBlank()) messageCache[ts] = text
                     count++
-                    XposedBridge.log("$TAG: [Reverb] Recovered from $table: otid=$otid -> '$text'")
                 }
             }
             q.close()
@@ -289,7 +312,6 @@ object MessengerHook {
                 if (m != null) return m.groupValues[1]
             }
 
-            // Find valid human-readable string sequence from payload
             val matches = Regex("""[\p{L}\p{N}\p{P}\p{Z}]{2,}""").findAll(s)
             val candidates = matches
                 .map { it.value.trim() }
@@ -333,7 +355,6 @@ object MessengerHook {
                                         putNotif(individualSender, resolvedText)
                                     }
                                 }
-                                XposedBridge.log("$TAG: [Notif] Cached message from '$title': '$resolvedText'")
                             }
 
                             val messagesArray = extras.getParcelableArray(Notification.EXTRA_MESSAGES)
@@ -344,7 +365,6 @@ object MessengerHook {
                                         val mSender = msgObj.getCharSequence("sender")?.toString()?.trim() ?: title
                                         if (!mSender.isNullOrBlank() && !mText.isNullOrBlank()) {
                                             putNotif(mSender, mText)
-                                            XposedBridge.log("$TAG: [Notif] Cached bundle message from '$mSender': '$mText'")
                                         }
                                     }
                                 }
@@ -361,8 +381,7 @@ object MessengerHook {
 
     /**
      * Hook all message models (Text, Photo, Sticker, Video, Audio, Document, Gif, Link).
-     * Caches the original live model instance into rawModelCache so it can be restored
-     * in the thread view UI when recalled.
+     * Caches the original live model instance in memory so it can be restored when recalled.
      */
     private fun hookMessageModels(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
         hookSingleModel(lp, modulePath, "text_class", "[TextMessage text=") { instance, clazz ->
@@ -436,19 +455,16 @@ object MessengerHook {
                     val instance = param.thisObject ?: return
                     try {
                         val ids = extractAllIdentifiers(instance)
-                        val text = extractText(instance, modelClass)
                         if (ids.isNotEmpty()) {
+                            val text = extractText(instance, modelClass)
                             for (id in ids) {
                                 rawModelCache[id] = instance
                                 if (text != null) {
                                     putMessage(id, text)
                                 }
                             }
-                            XposedBridge.log("$TAG: [Cache] Saved ${modelClass.simpleName} model (ids=$ids): '$text'")
                         }
-                    } catch (t: Throwable) {
-                        XposedBridge.log("$TAG: [$cacheKey] Error caching: $t")
-                    }
+                    } catch (_: Throwable) {}
                 }
             })
         }
@@ -488,13 +504,14 @@ object MessengerHook {
         XposedBridge.hookMethod(method, object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 try {
+                    val tombClass = tombstoneClass
                     for (i in param.args.indices) {
                         val list = param.args[i] as? List<*> ?: continue
                         if (list.isEmpty()) continue
 
                         var hasTombstone = false
                         for (item in list) {
-                            if (item != null && (item.javaClass.name.contains("5OO") || item.toString().contains("TombstoneMessage"))) {
+                            if (item != null && (tombClass?.isInstance(item) == true || item.javaClass.name.contains("5OO"))) {
                                 hasTombstone = true
                                 break
                             }
@@ -504,7 +521,7 @@ object MessengerHook {
                         var modified = false
                         val newList = ArrayList<Any?>(list.size)
                         for (item in list) {
-                            if (item != null && (item.javaClass.name.contains("5OO") || item.toString().contains("TombstoneMessage"))) {
+                            if (item != null && (tombClass?.isInstance(item) == true || item.javaClass.name.contains("5OO"))) {
                                 val ids = extractAllIdentifiers(item)
                                 var replacement: Any? = null
                                 for (id in ids) {
@@ -560,8 +577,9 @@ object MessengerHook {
         XposedBridge.hookMethod(method, object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 try {
+                    val tombClass = tombstoneClass
                     val arg = param.args.firstOrNull() ?: return
-                    if (arg.javaClass.name.contains("5OO") || arg.toString().contains("TombstoneMessage")) {
+                    if (tombClass?.isInstance(arg) == true || arg.javaClass.name.contains("5OO")) {
                         val ids = extractAllIdentifiers(arg)
                         for (id in ids) {
                             val cached = rawModelCache[id]
@@ -586,7 +604,7 @@ object MessengerHook {
      * and replaces snippet with the recovered message (as fallback when raw model is not available).
      */
     private fun hookTombstoneModel(lp: XC_LoadPackage.LoadPackageParam, modulePath: String) {
-        val tombstoneClass = Resolver.resolveClass(lp, modulePath, "tombstone_class") { bridge ->
+        val resolved = Resolver.resolveClass(lp, modulePath, "tombstone_class") { bridge ->
             val results = bridge.findClass {
                 matcher {
                     usingStrings("[TombstoneMessage snippet=")
@@ -595,18 +613,20 @@ object MessengerHook {
             results.firstOrNull()
         }
 
-        if (tombstoneClass == null) {
+        if (resolved == null) {
             XposedBridge.log("$TAG: [TombstoneModel] not found via DexKit")
             return
         }
 
-        for (constructor in tombstoneClass.declaredConstructors) {
+        tombstoneClass = resolved
+
+        for (constructor in resolved.declaredConstructors) {
             XposedBridge.hookMethod(constructor, object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val instance = param.thisObject ?: return
                     try {
                         val ids = extractAllIdentifiers(instance)
-                        for (field in tombstoneClass.declaredFields) {
+                        for (field in resolved.declaredFields) {
                             if (field.type == String::class.java) {
                                 field.isAccessible = true
                                 val oldSnippet = field.get(instance) as? String ?: continue
@@ -651,35 +671,33 @@ object MessengerHook {
                 }
             })
         }
-        XposedBridge.log("$TAG: [TombstoneModel] Hooked ${tombstoneClass.name} constructors")
+        XposedBridge.log("$TAG: [TombstoneModel] Hooked ${resolved.name} constructors")
     }
 
     /**
-     * Recursively extracts all identifiers (id, timeSent, MIDs, strings, longs) from a model object.
+     * Fast, zero-allocation identifier extraction.
+     * Directly inspects declared fields of the model object and its immediate message metadata
+     * (up to depth 1) without calling expensive toString() or Regex routines.
      */
     private fun extractAllIdentifiers(instance: Any): Set<String> {
-        val ids = mutableSetOf<String>()
-        val str = instance.toString()
+        val ids = HashSet<String>(8)
+        extractFromObj(instance, ids, 0)
+        return ids
+    }
 
-        val idMatch = Regex("""\bid=([^, \]]+)""").find(str)
-        if (idMatch != null) ids.add(idMatch.groupValues[1])
-
-        val timeMatch = Regex("""\btimeSent=(\d+)""").find(str)
-        if (timeMatch != null) ids.add(timeMatch.groupValues[1])
-
-        fun inspectObj(obj: Any?, depth: Int) {
-            if (obj == null || depth > 2) return
-            val clazz = obj.javaClass
-            val cName = clazz.name
-            if (cName.startsWith("java.lang.String") || cName.startsWith("android.")) return
-
+    private fun extractFromObj(obj: Any?, ids: MutableSet<String>, depth: Int) {
+        if (obj == null || depth > 1) return
+        var clazz: Class<*>? = obj.javaClass
+        while (clazz != null && clazz != Any::class.java) {
+            val name = clazz.name
+            if (name.startsWith("java.") || name.startsWith("android.")) break
             for (field in clazz.declaredFields) {
                 try {
                     field.isAccessible = true
                     val v = field.get(obj) ?: continue
                     when (v) {
                         is String -> {
-                            if (v.length in 4..64 && (v.all { it.isDigit() } || v.startsWith("mid.") || v.startsWith("mid$") || v.startsWith("m_"))) {
+                            if (v.length in 4..64 && (v.startsWith("mid.") || v.startsWith("mid$") || v.startsWith("m_") || v.all { it.isDigit() })) {
                                 ids.add(v)
                             }
                         }
@@ -689,16 +707,15 @@ object MessengerHook {
                             }
                         }
                         else -> {
-                            if (depth < 2 && !v.javaClass.isPrimitive && !v.javaClass.isArray) {
-                                inspectObj(v, depth + 1)
+                            if (depth == 0 && !v.javaClass.isPrimitive && !v.javaClass.isArray &&
+                                !v.javaClass.name.startsWith("java.") && !v.javaClass.name.startsWith("android.")) {
+                                extractFromObj(v, ids, depth + 1)
                             }
                         }
                     }
                 } catch (_: Throwable) {}
             }
+            clazz = clazz.superclass
         }
-
-        inspectObj(instance, 0)
-        return ids
     }
 }
